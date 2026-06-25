@@ -1,8 +1,16 @@
-from mathutils import cart2pol
-import numpy as np
-from math import factorial
-import numexpr as ne
+"""Zernike phase masks for SLM holography (Modelab basis convention).
 
+Weights live in unified vectors ``w_h`` and ``w_v`` indexed by basis row.
+``piston_h``, ``tilt_x_h``, and ``tilt_y_h`` are property aliases into ``w_h[0:3]``.
+"""
+
+from math import factorial
+from pathlib import Path
+
+import numexpr as ne
+import numpy as np
+
+#Double import so it can be used as module and in the notebook
 try:
     from .utils import (
         default_coefficients_dict,
@@ -10,6 +18,16 @@ try:
         load_coefficients_json,
         save_coefficients_json,
         zernike_coefficients_to_dict,
+    )
+    from .zernike_catalog import (
+        IDX_DEFOCUS,
+        expected_zernike_count,
+        get_mode_name,
+        idx_to_nm as catalog_idx_to_nm,
+        iter_modes,
+        nm_to_idx as catalog_nm_to_idx,
+        iter_modes_by_group,
+        ABERRATION_GROUPS
     )
 except ImportError:
     from utils import (
@@ -19,51 +37,178 @@ except ImportError:
         save_coefficients_json,
         zernike_coefficients_to_dict,
     )
+    from zernike_catalog import (
+        IDX_DEFOCUS,
+        expected_zernike_count,
+        get_mode_name,
+        idx_to_nm as catalog_idx_to_nm,
+        iter_modes,
+        nm_to_idx as catalog_nm_to_idx,
+        iter_modes_by_group,
+        ABERRATION_GROUPS
+    )
+
+
+def cart2pol(x, y):
+    """Cartesian to polar (rho, phi)."""
+    rho = np.sqrt(x ** 2 + y ** 2)
+    phi = np.arctan2(y, x)
+    return rho, phi
+
 
 class Zernikes:
+    """Build Modelab Zernike basis on an SLM grid and synthesize H/V phase masks.
 
-    def __init__(self, max_zernike_radial_number = 6, mask_size_x_in_pixels = 1024, mask_size_y_in_pixels = 1024, aperture_diameter_in_m = 7.5e-3,
-                 SLM_pixel_size_in_um = 9.2e-6, coefs_path = None):
+    Coefficients are stored in ``w_h`` and ``w_v`` (one entry per basis index).
+    Named attributes ``piston_h``, ``tilt_x_h``, ``tilt_y_h`` (and V counterparts)
+    are views into indices 0, 1, and 2.
+    """
 
+    def __init__(
+        self,
+        max_zernike_radial_number=6,
+        mask_size_x_in_pixels=1024,
+        mask_size_y_in_pixels=1024,
+        aperture_diameter_in_m=7.5e-3,
+        SLM_pixel_size_in_um=9.2e-6,
+        coefs_path=None,
+    ):
+        """Create Zernike basis, load coefficients, and compute initial phase masks.
+
+        Args:
+            max_zernike_radial_number: Maximum radial order n for the basis.
+            mask_size_x_in_pixels: Mask width in pixels.
+            mask_size_y_in_pixels: Mask height in pixels.
+            aperture_diameter_in_m: Aperture diameter in metres.
+            SLM_pixel_size_in_um: Pixel size in metres (9.2 µm stored as 9.2e-6).
+            coefs_path: Optional JSON coefficients file; zeros if omitted.
+        """
         self.max_zernike_radial_number = max_zernike_radial_number
+        self.mask_size_x_in_pixels = mask_size_x_in_pixels
+        self.mask_size_y_in_pixels = mask_size_y_in_pixels
+        self.aperture_diameter_in_m = aperture_diameter_in_m
+        self.SLM_pixel_size_in_um = SLM_pixel_size_in_um
 
-        # mask midpoint
-        half_width = mask_size_x_in_pixels/2.0
-        half_height = mask_size_y_in_pixels/2.0
+        half_width = mask_size_x_in_pixels / 2.0
+        half_height = mask_size_y_in_pixels / 2.0
 
-        # Makes a polar grid with r = 1 at r_norm (in pixels). This properly fits the Zernike to the required aperture
-        x,y = np.meshgrid(np.linspace(0, mask_size_x_in_pixels - 1, mask_size_x_in_pixels, dtype = np.float32),\
-                        np.linspace(0, mask_size_y_in_pixels - 1, mask_size_y_in_pixels, dtype = np.float32))
+        x, y = np.meshgrid(
+            np.linspace(0, mask_size_x_in_pixels - 1, mask_size_x_in_pixels, dtype=np.float32),
+            np.linspace(0, mask_size_y_in_pixels - 1, mask_size_y_in_pixels, dtype=np.float32),
+        )
         rho, phi = cart2pol(x - half_width, y - half_height)
 
-        self.N = rho.shape[0] # Defines the array size on which we calculate the Zernikes (same as mask_size_x_in_pixels & mask_size_y_in_pixels if square)
+        self.N = rho.shape[0]
+        r_norm = aperture_diameter_in_m / SLM_pixel_size_in_um / 2
+        rho = rho / r_norm
 
-        r_norm = aperture_diameter_in_m/SLM_pixel_size_in_um/2
-        rho = rho/r_norm  
+        self.zernike_basis_array = self.generate_zernike_basis(
+            rho, phi, max_zernike_radial_number
+        )
+        self._init_buffers()
+        self.coefs_path = None
 
-        self.zernike_basis_array = self.generate_zernike_basis(rho, phi, max_zernike_radial_number, mask_size_x_in_pixels, mask_size_y_in_pixels)
-        
         if coefs_path is not None:
             self.load_coefs(coefs_path)
         else:
             self.clean()
 
-        self.modify_zernike_coefs()
-        self.make_zernike_fields()
-        
-        
+        self.write_backup_of_zernike_coefs()
+        self.calculate_znk_phase_mask(restore_coefs=False)
+
+    @staticmethod
+    def nm_to_idx(n, m):
+        """Basis index for mode (n, m). Weight lives at ``w_h[nm_to_idx(n, m)]``."""
+        return catalog_nm_to_idx(n, m)
+
+    @staticmethod
+    def idx_to_nm(idx):
+        """Return (n, m) for basis row ``idx`` (e.g. ``idx_to_nm(4)`` -> defocus)."""
+        return catalog_idx_to_nm(idx)
+
+    def _init_buffers(self):
+        """Preallocate coefficient, scratch, and output phase buffers."""
+        count = expected_zernike_count(self.max_zernike_radial_number)
+        self.w_h = np.zeros(count, dtype=np.float32)
+        self.w_v = np.zeros(count, dtype=np.float32)
+
+        self.znk_phase_h = np.zeros((self.N, self.N), dtype=np.float32)
+        self.znk_phase_v = np.zeros((self.N, self.N), dtype=np.float32)
+        self._zern_phase_flat_h = np.zeros(self.N * self.N, dtype=np.float32)
+        self._zern_phase_flat_v = np.zeros(self.N * self.N, dtype=np.float32)
+        self._basis_flat = self.zernike_basis_array.reshape(self.zernike_count, -1)
+
+    @property
+    def piston_h(self):
+        """H-pol piston (basis index 0). Alias into ``w_h[0]``."""
+        return self.w_h[0]
+
+    @piston_h.setter
+    def piston_h(self, value):
+        # piston_h = x  <=>  w_h[0] = x
+        self.w_h[0] = np.float32(value)
+
+    @property
+    def tilt_x_h(self):
+        """H-pol tilt X (basis index 1, Z_1^{-1}). Alias into ``w_h[1]``."""
+        return self.w_h[1]
+
+    @tilt_x_h.setter
+    def tilt_x_h(self, value):
+        # tilt_x_h = x  <=>  w_h[1] = x
+        self.w_h[1] = np.float32(value)
+
+    @property
+    def tilt_y_h(self):
+        """H-pol tilt Y (basis index 2, Z_1^{+1}). Alias into ``w_h[2]``."""
+        return self.w_h[2]
+
+    @tilt_y_h.setter
+    def tilt_y_h(self, value):
+        # tilt_y_h = x  <=>  w_h[2] = x
+        self.w_h[2] = np.float32(value)
+
+    @property
+    def piston_v(self):
+        """V-pol piston (basis index 0). Alias into ``w_v[0]``."""
+        return self.w_v[0]
+
+    @piston_v.setter
+    def piston_v(self, value):
+        self.w_v[0] = np.float32(value)
+
+    @property
+    def tilt_x_v(self):
+        """V-pol tilt X (basis index 1). Alias into ``w_v[1]``."""
+        return self.w_v[1]
+
+    @tilt_x_v.setter
+    def tilt_x_v(self, value):
+        self.w_v[1] = np.float32(value)
+
+    @property
+    def tilt_y_v(self):
+        """V-pol tilt Y (basis index 2). Alias into ``w_v[2]``."""
+        return self.w_v[2]
+
+    @tilt_y_v.setter
+    def tilt_y_v(self, value):
+        self.w_v[2] = np.float32(value)
 
     @staticmethod
     def _radial_coefficients(n, m_abs):
         coeffs = []
         for k in range((n - m_abs) // 2 + 1):
-            c = ((-1)**k) * factorial(n - k) / (
-                factorial(k) * factorial((n + m_abs) // 2 - k) * factorial((n - m_abs) // 2 - k)
+            c = ((-1) ** k) * factorial(n - k) / (
+                factorial(k)
+                * factorial((n + m_abs) // 2 - k)
+                * factorial((n - m_abs) // 2 - k)
             )
             coeffs.append((np.float32(c), n - 2 * k))
         return coeffs
 
     def _build_rho_powers(self, rho, max_radial_idx):
+        """Cache rho**k powers up to 2*max_radial_idx."""
         max_power = 2 * max_radial_idx
         rho_powers = [np.ones_like(rho, dtype=np.float32)]
         for power in range(1, max_power + 1):
@@ -71,6 +216,7 @@ class Zernikes:
         return rho_powers
 
     def _compute_radial_nm(self, rho, rho_powers, n, m_abs, radial_coeffs_cache):
+        """Radial polynomial R_n^|m|(rho) on the instance grid."""
         r_nm = np.zeros((self.N, self.N), dtype=np.float32)
         key = (n, m_abs)
         if key not in radial_coeffs_cache:
@@ -85,23 +231,24 @@ class Zernikes:
         return r_nm
 
     def _calculate_modelab_angular_convention(self, r_nm, phi, n, m, odd=True):
-        # Conversion factors from standard basis (wiki, Born & Wolf, Wolfram) to Modelab basis.
+        """Angular part with Modelab sign convention."""
         if odd:
             if n % 2 == 0:
-                z_nm = (-1)**(m // 2 + 1) * r_nm * np.sin(m * phi)
+                z_nm = (-1) ** (m // 2 + 1) * r_nm * np.sin(m * phi)
             else:
-                z_nm = (-1)**((m + 1) // 2) * r_nm * np.cos(m * phi)
+                z_nm = (-1) ** ((m + 1) // 2) * r_nm * np.cos(m * phi)
         else:
             if (n % 2 == 0) and (m == 0):
-                z_nm = r_nm * np.cos(m * phi) + (-1)**(n // 2 + 1)
+                z_nm = r_nm * np.cos(m * phi) + (-1) ** (n // 2 + 1)
             elif (n % 2 == 0) and (m != 0):
-                z_nm = (-1)**(m // 2) * r_nm * np.cos(m * phi)
+                z_nm = (-1) ** (m // 2) * r_nm * np.cos(m * phi)
             else:
-                z_nm = (-1)**((m + 1) // 2) * r_nm * np.sin(m * phi)
+                z_nm = (-1) ** ((m + 1) // 2) * r_nm * np.sin(m * phi)
         return z_nm
 
-    def generate_zernike_basis(self, rho, phi, max_radial_idx, mask_size_x_in_pixels, mask_size_y_in_pixels):
-        self.zernike_count = (max_radial_idx + 1) ** 2
+    def generate_zernike_basis(self, rho, phi, max_radial_idx):
+        """Precompute Modelab Zernike modes on the polar grid."""
+        self.zernike_count = expected_zernike_count(max_radial_idx)
         zernike_basis_array = np.zeros((self.zernike_count, self.N, self.N), dtype=np.float32)
 
         rho_powers = self._build_rho_powers(rho, max_radial_idx)
@@ -123,27 +270,18 @@ class Zernikes:
                 zernike_basis_array[idx] = z_nm
 
         return zernike_basis_array
-    
+
     def _apply_coefficients(self, coefficients):
+        """Load mask centers and unified weight vectors from a coefficient dict."""
         self.h_mask_center_x = coefficients["h_mask_center_x"]
         self.h_mask_center_y = coefficients["h_mask_center_y"]
         self.v_mask_center_x = coefficients["v_mask_center_x"]
         self.v_mask_center_y = coefficients["v_mask_center_y"]
-
-        self.piston_h = coefficients["piston_h"]
-        self.tilt_x_h = coefficients["tilt_x_h"]
-        self.tilt_y_h = coefficients["tilt_y_h"]
-        self.piston_v = coefficients["piston_v"]
-        self.tilt_x_v = coefficients["tilt_x_v"]
-        self.tilt_y_v = coefficients["tilt_y_v"]
-
-        self.w_h = coefficients["w_h"]
-        self.w_v = coefficients["w_v"]
-        self.n = coefficients["n"]
-        self.m = coefficients["m"]
-        self.zern_idxs = coefficients["zern_idxs"]
+        self.w_h = np.asarray(coefficients["w_h"], dtype=np.float32)
+        self.w_v = np.asarray(coefficients["w_v"], dtype=np.float32)
 
     def clean(self):
+        """Reset all coefficients and mask centers to zero."""
         self._apply_coefficients(
             dict_to_zernike_coefficients(
                 default_coefficients_dict(self.max_zernike_radial_number),
@@ -152,118 +290,159 @@ class Zernikes:
         )
 
     def load_coefs(self, path):
+        """Load coefficients from JSON (instance radial order wins on mismatch)."""
         data = load_coefficients_json(path)
         coefficients = dict_to_zernike_coefficients(
             data,
             max_zernike_radial_number=self.max_zernike_radial_number,
         )
         self._apply_coefficients(coefficients)
+        self.coefs_path = str(Path(path).resolve())
 
     def save_coefs(self, path):
+        """Save current coefficients to JSON."""
         data = zernike_coefficients_to_dict(self)
         save_coefficients_json(path, data)
+        self.coefs_path = str(Path(path).resolve())
 
     def write_backup_of_zernike_coefs(self):
-        # Write a copy of piston coefs
-        self.b_piston_h = self.piston_h
-        self.b_piston_v = self.piston_v
-
-        # Write a copy of tilt coefs
-        self.b_tilt_x_h = self.tilt_x_h
-        self.b_tilt_y_h = self.tilt_y_h
-
-        self.b_tilt_x_v = self.tilt_x_v
-        self.b_tilt_y_v = self.tilt_y_v
-
-        # Write a copy of the rest of Zernikes. WATCH it!!! This time we need a real copy of array to avoid modifing the original using the view
+        """Snapshot current ``w_h`` / ``w_v`` as the base coefficient state."""
         self.b_w_h = np.copy(self.w_h)
         self.b_w_v = np.copy(self.w_v)
 
     def read_backup_of_zernike_coefs(self):
-        # Read a copy of piston coefs
-        self.piston_h = self.b_piston_h
-        self.piston_v = self.b_piston_v
-
-        # Read a copy of tilt coefs
-        self.tilt_x_h = self.b_tilt_x_h
-        self.tilt_y_h = self.b_tilt_y_h
-
-        self.tilt_x_v = self.b_tilt_x_v
-        self.tilt_y_v = self.b_tilt_y_v
-
-        # Read a copy of the rest of Zernikes
+        """Restore ``w_h`` / ``w_v`` from the last backup snapshot."""
         self.w_h = np.copy(self.b_w_h)
         self.w_v = np.copy(self.b_w_v)
 
-    def modify_zernike_coefs(self, apply_tilt_offset = False, apply_defocus_offset = False, scan_tilt = False, scan_defocus = False, **kwargs):
+    def modify_zernike_coefs(
+        self,
+        apply_tilt_offset=False,
+        apply_defocus_offset=False,
+        scan_tilt=False,
+        scan_defocus=False,
+        **kwargs,
+    ):
+        """Apply temporary tilt/defocus offsets or scans (not used at init).
 
-        # NOTE: I'm doing the calc with numexpr module as it gives 10x speed up. Now it is faster then the SLM so no need to push it further for now
-        self.write_backup_of_zernike_coefs() # Save the original Zernike coefs (originals loaded after the Zernike field is calculated)
+        Snapshots backup first. Follow with ``calculate_znk_phase_mask(restore_coefs=True)``.
+        """
+        self.write_backup_of_zernike_coefs()
 
-        # ================ Making sure all the required offsets for tilt and defocus are applied to Zernikes =========================================
         if apply_tilt_offset or apply_defocus_offset:
-            if 'MASK_corrections' in kwargs:
-                MASK_corrections = kwargs.get('MASK_corrections')
+            if "MASK_corrections" not in kwargs:
+                raise ValueError(
+                    '"apply_tilt_offset" or "apply_defocus_offset" requires '
+                    '"MASK_corrections" dictionary.'
+                )
+            mask_corrections = kwargs["MASK_corrections"]
 
-                if apply_tilt_offset:
-                    self.tilt_x_h += MASK_corrections['tilt_x_H']
-                    self.tilt_y_h += MASK_corrections['tilt_y_H']
-                    
-                    self.tilt_x_v += MASK_corrections['tilt_x_V']
-                    self.tilt_y_v += MASK_corrections['tilt_y_V'] 
+            if apply_tilt_offset:
+                self.tilt_x_h += mask_corrections["tilt_x_H"]
+                self.tilt_y_h += mask_corrections["tilt_y_H"]
+                self.tilt_x_v += mask_corrections["tilt_x_V"]
+                self.tilt_y_v += mask_corrections["tilt_y_V"]
 
-                if apply_defocus_offset:       
-                    self.w_h[1] += MASK_corrections['defocus_H']
-                    self.w_v[1] += MASK_corrections['defocus_V']      
-            else:
-                raise Exception('"apply_tilt_offset = True" or "apply_defocus_offset = True" requires "MASK_corrections" dictionary.')
-        # /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+            if apply_defocus_offset:
+                self.w_h[IDX_DEFOCUS] += mask_corrections["defocus_H"]
+                self.w_v[IDX_DEFOCUS] += mask_corrections["defocus_V"]
 
-        # ================ Let's scan using tilt_x and tilt_y =========================================
         if scan_tilt:
-            if all (key in kwargs for key in ('tilt_x','tilt_y')):
-                tilt_x = kwargs.get('tilt_x')
-                tilt_y = kwargs.get('tilt_y')
+            if not all(key in kwargs for key in ("tilt_x", "tilt_y")):
+                raise ValueError('scan_tilt=True requires "tilt_x" and "tilt_y" keyword arguments.')
+            self.tilt_x_h += kwargs["tilt_x"]
+            self.tilt_y_h += kwargs["tilt_y"]
+            self.tilt_x_v += kwargs["tilt_x"]
+            self.tilt_y_v += kwargs["tilt_y"]
 
-                self.tilt_x_h += tilt_x
-                self.tilt_y_h += tilt_y
-                    
-                self.tilt_x_v += tilt_x
-                self.tilt_y_v += tilt_y                
-            else:
-                raise Exception('scan_tilt = "True" requires "tilt_x", "tilt_y" keyword arguments')                
-        # /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-        # ================ Let's scan defocus =========================================      
         if scan_defocus:
-            if 'defocus' in kwargs:   
-                defocus = kwargs.get('defocus')
+            if "defocus" not in kwargs:
+                raise ValueError('scan_defocus=True requires "defocus" keyword argument.')
+            self.w_h[IDX_DEFOCUS] += kwargs["defocus"]
+            self.w_v[IDX_DEFOCUS] += kwargs["defocus"]
 
-                self.w_h[1] += defocus
-                self.w_v[1] += defocus             
-            else:
-                raise Exception('scan_defocus = "True" requires "defocus" keyword arguments') 
-        # /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        
-    def make_zernike_fields(self):       
-        # set the total Zernike phase array in H,V pol to 0
-        zern_phase_h = np.zeros((self.N,self.N), dtype = np.float32)
-        zern_phase_v = np.zeros((self.N,self.N), dtype = np.float32)
+    def calculate_znk_phase_mask(self, restore_coefs=False):
+        """Synthesize wrapped phase masks ``znk_phase_h`` and ``znk_phase_v``.
 
-        
-        # calculate the phase coming from Zernikes and modelab coefficients (piston, tilt_x and tilt_y are not part of this, that's why there is  (-3) in the loop)
-        for i in range(self.zernike_count - 3):
-            zern_phase_h += ne.evaluate('w_h_i*zern_i', {'w_h_i': self.w_h[i], 'zern_i': self.zernike_basis_array[self.zern_idxs[i],:,:]})
-            zern_phase_v += ne.evaluate('w_v_i*zern_i', {'w_v_i': self.w_v[i], 'zern_i': self.zernike_basis_array[self.zern_idxs[i],:,:]})
+        Computes the phase as ``w @ basis`` (1D weights × 2D basis), then wraps
+        to [-pi, pi] radians (same convention as ``pyLCOS._addMasks``).
 
-        # add tilts (not piston as I never used it so far)    
-        zern_phase_h += ne.evaluate('tilt_x_h*zern_1 + tilt_y_h*zern_2', {'tilt_x_h': self.tilt_x_h, 'tilt_y_h': self.tilt_y_h,\
-                                                                        'zern_1': self.zernike_basis_array[1,:,:], 'zern_2': self.zernike_basis_array[2,:,:]})
-        zern_phase_v += ne.evaluate('tilt_x_v*zern_1 + tilt_y_v*zern_2', {'tilt_x_v': self.tilt_x_v, 'tilt_y_v': self.tilt_y_v,\
-                                                                        'zern_1': self.zernike_basis_array[1,:,:], 'zern_2': self.zernike_basis_array[2,:,:]})
-        
-        # Make the fields from zern_phase
-        self.field_h = ne.evaluate('exp(1j*pi*zern_phase_h)', {'zern_phase_h': zern_phase_h, 'pi': np.pi}).astype(np.complex64)
-        self.field_v = ne.evaluate('exp(1j*pi*zern_phase_v)', {'zern_phase_v': zern_phase_v, 'pi': np.pi}).astype(np.complex64)
+        Args:
+            restore_coefs: If True, restore ``w_h``/``w_v`` from backup after computing
+                (use after ``modify_zernike_coefs`` scans).
+        """
+        np.matmul(self.w_h, self._basis_flat, out=self._zern_phase_flat_h)
+        np.matmul(self.w_v, self._basis_flat, out=self._zern_phase_flat_v)
 
-        self.read_backup_of_zernike_coefs()  # Revert Zernnike coefs back to their original state
+        pi = np.pi
+        z_h = self._zern_phase_flat_h.reshape(self.N, self.N)
+        z_v = self._zern_phase_flat_v.reshape(self.N, self.N)
+        ne.evaluate(
+            "(((pi * z + pi) % (2*pi)) - pi)",
+            out=self.znk_phase_h,
+            local_dict={"z": z_h, "pi": pi},
+        )
+        ne.evaluate(
+            "(((pi * z + pi) % (2*pi)) - pi)",
+            out=self.znk_phase_v,
+            local_dict={"z": z_v, "pi": pi},
+        )
+
+        if restore_coefs:
+            self.read_backup_of_zernike_coefs()
+
+    def make_zernike_fields(self, restore_coefs=False):
+        """Deprecated alias for ``calculate_znk_phase_mask``."""
+        self.calculate_znk_phase_mask(restore_coefs=restore_coefs)
+
+    def filter_coefficients_by_aberration_keys(self, pol: str, *aberration_keys: str ):
+        """Filter coefficients by polarization and aberration keys. Return the coefficients and the indices of the filtered coefficients."""
+
+        groups = iter_modes_by_group(self.max_zernike_radial_number)
+        idx_list = []
+        for aberration_key in aberration_keys:
+            if aberration_key not in groups:
+                raise KeyError(f"Unknown or empty aberration group: {aberration_key!r}, supported keys are: {ABERRATION_GROUPS}")
+            idx_list.extend(idx for idx, _, _ in groups[aberration_key])
+
+        idx_list = sorted(set(idx_list)) #eliminate duplicated and sorted them ascending
+
+        if pol == "H":
+            return self.w_h[idx_list], idx_list
+        elif pol == "V":
+            return self.w_v[idx_list], idx_list
+        else:
+            raise ValueError(f"Invalid polarization: {pol}")
+
+
+    def generate_table(self, dataframe = True):
+        """Print and return coefficient table: index, n, m, H, V, name.
+
+        Uses pandas if available; otherwise prints aligned text and returns a list of dicts.
+        """
+        rows = []
+        for idx, n, m in iter_modes(self.max_zernike_radial_number):
+            rows.append(
+                {
+                    "index": idx,
+                    "n": n,
+                    "m": m,
+                    "H": float(self.w_h[idx]),
+                    "V": float(self.w_v[idx]),
+                    "name": get_mode_name(n, m),
+                }
+            )
+
+        try:
+            if dataframe:
+                import pandas as pd
+
+                df = pd.DataFrame(rows)
+                self.table_output = df.to_string(index=False)
+
+                return df
+
+        except ImportError:
+            header = f"{'index':>5}  {'n':>2}  {'m':>3}  {'H':>10}  {'V':>10}  name"
+
+            return header, rows

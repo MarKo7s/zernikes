@@ -1,12 +1,29 @@
+"""JSON coefficient I/O and assembly for the Zernikes module."""
+
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
+
+try:
+    from .zernike_catalog import (
+        basis_index,
+        expected_zernike_count,
+        iter_modes,
+    )
+except ImportError:
+    from zernike_catalog import (
+        basis_index,
+        expected_zernike_count,
+        iter_modes,
+    )
 
 COEFFICIENTS_VERSION = 1
 
 
 def build_nm_lists(max_zernike_radial_number):
+    """Build parallel n, m lists for higher-order modes (n >= 2)."""
     n_list = []
     m_list = []
     for n_idx in range(2, max_zernike_radial_number + 1):
@@ -17,10 +34,12 @@ def build_nm_lists(max_zernike_radial_number):
 
 
 def expected_w_length(max_zernike_radial_number):
-    return sum(2 * n_idx + 1 for n_idx in range(2, max_zernike_radial_number + 1))
+    """Length of compact higher-order w vector in JSON (modes with n >= 2)."""
+    return sum(n_idx + 1 for n_idx in range(2, max_zernike_radial_number + 1))
 
 
 def default_coefficients_dict(max_zernike_radial_number):
+    """Default zero coefficient dictionary for JSON export."""
     w_len = expected_w_length(max_zernike_radial_number)
     n_list, m_list = build_nm_lists(max_zernike_radial_number)
     zero_w = [0.0] * w_len
@@ -48,41 +67,8 @@ def default_coefficients_dict(max_zernike_radial_number):
     }
 
 
-def zernike_coefficients_to_dict(zernikes):
-    w_h = np.asarray(zernikes.w_h, dtype=np.float32)
-    w_v = np.asarray(zernikes.w_v, dtype=np.float32)
-    n_list, m_list = build_nm_lists(zernikes.max_zernike_radial_number)
-
-    return {
-        "version": COEFFICIENTS_VERSION,
-        "max_zernike_radial_number": zernikes.max_zernike_radial_number,
-        "mask_centers": {
-            "H": {
-                "x": int(zernikes.h_mask_center_x),
-                "y": int(zernikes.h_mask_center_y),
-            },
-            "V": {
-                "x": int(zernikes.v_mask_center_x),
-                "y": int(zernikes.v_mask_center_y),
-            },
-        },
-        "H": {
-            "piston": float(zernikes.piston_h),
-            "tilt_x": float(zernikes.tilt_x_h),
-            "tilt_y": float(zernikes.tilt_y_h),
-            "w": w_h.tolist(),
-        },
-        "V": {
-            "piston": float(zernikes.piston_v),
-            "tilt_x": float(zernikes.tilt_x_v),
-            "tilt_y": float(zernikes.tilt_y_v),
-            "w": w_v.tolist(),
-        },
-        "nm": [[n, m] for n, m in zip(n_list, m_list)],
-    }
-
-
-def _validate_coefficients_data(data, max_zernike_radial_number=None):
+def _validate_coefficients_data(data):
+    """Validate JSON structure against the file's own max radial order."""
     if data.get("version") != COEFFICIENTS_VERSION:
         raise ValueError(
             f"Unsupported coefficients version: {data.get('version')!r}. "
@@ -92,12 +78,6 @@ def _validate_coefficients_data(data, max_zernike_radial_number=None):
     file_max_n = data.get("max_zernike_radial_number")
     if file_max_n is None:
         raise ValueError("Coefficients file is missing 'max_zernike_radial_number'.")
-
-    if max_zernike_radial_number is not None and file_max_n != max_zernike_radial_number:
-        raise ValueError(
-            f"Coefficients max_zernike_radial_number={file_max_n} does not match "
-            f"Zernikes instance max_zernike_radial_number={max_zernike_radial_number}."
-        )
 
     expected_len = expected_w_length(file_max_n)
     for pol in ("H", "V"):
@@ -122,9 +102,9 @@ def _validate_coefficients_data(data, max_zernike_radial_number=None):
             raise ValueError(f"Coefficients file is missing 'mask_centers.{pol}'.")
 
 
-def dict_to_zernike_coefficients(data, max_zernike_radial_number=None):
-    _validate_coefficients_data(data, max_zernike_radial_number)
-
+def _file_pol_lookup(data, pol):
+    """Build (n, m) -> weight lookup from one polarization section of a JSON file."""
+    pol_data = data[pol]
     file_max_n = data["max_zernike_radial_number"]
     n_list, m_list = build_nm_lists(file_max_n)
 
@@ -134,29 +114,129 @@ def dict_to_zernike_coefficients(data, max_zernike_radial_number=None):
         if file_nm != expected_nm:
             raise ValueError("Coefficients 'nm' list does not match expected Zernike ordering.")
 
+    lookup = {
+        (0, 0): float(pol_data["piston"]),
+        (1, -1): float(pol_data["tilt_x"]),
+        (1, 1): float(pol_data["tilt_y"]),
+    }
+    for (n, m), weight in zip(zip(n_list, m_list), pol_data["w"]):
+        lookup[(n, m)] = float(weight)
+    return lookup
+
+
+def _warn_order_mismatch(file_max_n, instance_max_n):
+    """Warn when file radial order differs from the Zernikes instance."""
+    if file_max_n == instance_max_n:
+        return
+    if file_max_n > instance_max_n:
+        warnings.warn(
+            f"Coefficients file max_zernike_radial_number={file_max_n} is greater than "
+            f"instance max_zernike_radial_number={instance_max_n}; "
+            f"higher-order file coefficients are ignored.",
+            stacklevel=3,
+        )
+    else:
+        warnings.warn(
+            f"Coefficients file max_zernike_radial_number={file_max_n} is less than "
+            f"instance max_zernike_radial_number={instance_max_n}; "
+            f"missing modes default to zero.",
+            stacklevel=3,
+        )
+
+
+def _assemble_weight_vector(pol_lookup, instance_max_n, file_max_n):
+    """Map file coefficients onto a unified instance-sized weight vector."""
+    count = expected_zernike_count(instance_max_n)
+    weights = np.zeros(count, dtype=np.float32)
+    ignored = 0
+
+    for idx, n, m in iter_modes(instance_max_n):
+        if (n, m) in pol_lookup:
+            weights[idx] = np.float32(pol_lookup[(n, m)])
+        elif n <= file_max_n:
+            pass
+        else:
+            ignored += 1
+
+    file_modes = set(pol_lookup.keys()) - {(0, 0), (1, -1), (1, 1)}
+    for n, m in file_modes:
+        if n > instance_max_n:
+            ignored += 1
+
+    if ignored > 0 and file_max_n > instance_max_n:
+        warnings.warn(
+            f"Ignored {ignored} coefficient(s) from file with n > {instance_max_n}.",
+            stacklevel=3,
+        )
+
+    return weights
+
+
+def dict_to_zernike_coefficients(data, max_zernike_radial_number=None):
+    """Convert JSON dict to internal coefficient arrays for a Zernikes instance."""
+    _validate_coefficients_data(data)
+
+    if max_zernike_radial_number is None:
+        raise ValueError("max_zernike_radial_number is required when loading coefficients.")
+
+    file_max_n = data["max_zernike_radial_number"]
+    _warn_order_mismatch(file_max_n, max_zernike_radial_number)
+
+    lookup_h = _file_pol_lookup(data, "H")
+    lookup_v = _file_pol_lookup(data, "V")
+
     return {
         "h_mask_center_x": int(data["mask_centers"]["H"]["x"]),
         "h_mask_center_y": int(data["mask_centers"]["H"]["y"]),
         "v_mask_center_x": int(data["mask_centers"]["V"]["x"]),
         "v_mask_center_y": int(data["mask_centers"]["V"]["y"]),
-        "piston_h": np.float32(data["H"]["piston"]),
-        "tilt_x_h": np.float32(data["H"]["tilt_x"]),
-        "tilt_y_h": np.float32(data["H"]["tilt_y"]),
-        "piston_v": np.float32(data["V"]["piston"]),
-        "tilt_x_v": np.float32(data["V"]["tilt_x"]),
-        "tilt_y_v": np.float32(data["V"]["tilt_y"]),
-        "w_h": np.asarray(data["H"]["w"], dtype=np.float32),
-        "w_v": np.asarray(data["V"]["w"], dtype=np.float32),
-        "n": n_list,
-        "m": m_list,
-        "zern_idxs": np.asarray(
-            [(n * (n + 2) + m) // 2 for n, m in zip(n_list, m_list)],
-            dtype=np.int64,
-        ),
+        "w_h": _assemble_weight_vector(lookup_h, max_zernike_radial_number, file_max_n),
+        "w_v": _assemble_weight_vector(lookup_v, max_zernike_radial_number, file_max_n),
+    }
+
+
+def zernike_coefficients_to_dict(zernikes):
+    """Serialize Zernikes instance coefficients to a JSON-ready dictionary."""
+    max_n = zernikes.max_zernike_radial_number
+    n_list, m_list = build_nm_lists(max_n)
+    compact_w_h = []
+    compact_w_v = []
+    for n, m in zip(n_list, m_list):
+        idx = basis_index(n, m)
+        compact_w_h.append(float(zernikes.w_h[idx]))
+        compact_w_v.append(float(zernikes.w_v[idx]))
+
+    return {
+        "version": COEFFICIENTS_VERSION,
+        "max_zernike_radial_number": max_n,
+        "mask_centers": {
+            "H": {
+                "x": int(zernikes.h_mask_center_x),
+                "y": int(zernikes.h_mask_center_y),
+            },
+            "V": {
+                "x": int(zernikes.v_mask_center_x),
+                "y": int(zernikes.v_mask_center_y),
+            },
+        },
+        "H": {
+            "piston": float(zernikes.w_h[0]),
+            "tilt_x": float(zernikes.w_h[1]),
+            "tilt_y": float(zernikes.w_h[2]),
+            "w": compact_w_h,
+        },
+        "V": {
+            "piston": float(zernikes.w_v[0]),
+            "tilt_x": float(zernikes.w_v[1]),
+            "tilt_y": float(zernikes.w_v[2]),
+            "w": compact_w_v,
+        },
+        "nm": [[n, m] for n, m in zip(n_list, m_list)],
     }
 
 
 def save_coefficients_json(path, data):
+    """Write coefficient dictionary to a JSON file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -165,6 +245,7 @@ def save_coefficients_json(path, data):
 
 
 def load_coefficients_json(path):
+    """Load coefficient dictionary from a JSON file."""
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
