@@ -1,17 +1,27 @@
 # Zernikes
 
-Modelab Zernike basis and phase-mask synthesis for SLM holography.
+ModeLab Zernike basis and phase-mask synthesis for SLM holography. Built on the ModeLab packaging stack: install a tagged release instead of `sys.path` hacks.
 
-Add the repo folder to `sys.path`, then import the module file directly:
+## Package layout
+
+```
+zernikes/
+├── pyZernikes.py            Zernikes class (basis, phase synthesis, scans)
+├── zernike_catalog.py       index ↔ (n, m) ↔ names; aberration groups
+├── utils.py                 JSON load/save and coefficient assembly
+├── ui/                      optional PySide6 editor + pyqtgraph viewport
+├── tests/                   notebook launcher
+├── scripts/release.py       git-tag release automation
+├── pyproject.toml           package metadata + version
+└── CHANGELOG.md
+```
+
+## Canonical imports
 
 ```python
-from pathlib import Path
-import sys
-
-zernikes_dir = Path("/path/to/algorithms/zernikes")
-sys.path.insert(0, str(zernikes_dir))
-
 from zernikes import Zernikes
+from zernikes.zernike_catalog import iter_modes_by_group, ABERRATION_GROUPS
+from zernikes.ui import ZernikesWidget  # requires the gui extra
 ```
 
 ## Coefficient model
@@ -54,7 +64,7 @@ phase_v = z.znk_phase_v
 
 ## Aberration groups
 
-Modes are classified in [`zernike_catalog.py`](zernike_catalog.py) for the UI and for group-wise optimization:
+Modes are classified in `zernikes.zernike_catalog` for the UI and for group-wise optimization:
 
 | Key | Rule |
 |-----|------|
@@ -67,7 +77,7 @@ Modes are classified in [`zernike_catalog.py`](zernike_catalog.py) for the UI an
 | `foil` | \|m\| ≥ 3 |
 
 ```python
-from zernike_catalog import iter_modes_by_group, ABERRATION_GROUPS
+from zernikes.zernike_catalog import iter_modes_by_group, ABERRATION_GROUPS
 
 groups = iter_modes_by_group(z.max_zernike_radial_number)
 # groups["defocus"] → [(4, 2, 0), ...]   each tuple is (index, n, m)
@@ -134,7 +144,7 @@ then wrapped to `[-π, π]` via `((π·φ + π) mod 2π) − π`.
 
 ## UI widget
 
-PySide6 editor for an existing `Zernikes` instance. Requires **PySide6**; the optional phase viewport also needs **pyqtgraph**.
+PySide6 editor for an existing `Zernikes` instance. Install the **`gui`** extra (**PySide6**; the optional phase viewport also needs **pyqtgraph**).
 
 Features:
 
@@ -145,7 +155,7 @@ Features:
 
 ```python
 from zernikes import Zernikes
-from ui.widget import ZernikesWidget
+from zernikes.ui import ZernikesWidget
 
 z = Zernikes(max_zernike_radial_number=6, mask_size_x_in_pixels=256, mask_size_y_in_pixels=256)
 gui = ZernikesWidget(z)
@@ -162,20 +172,103 @@ gui._regenerate_phase()       # recalculates masks and open viewport
 
 See [`tests/zernikes_widget.ipynb`](tests/zernikes_widget.ipynb) for a notebook launcher (`%gui qt`).
 
-## Module layout
-
-| File | Role |
-|------|------|
-| `zernikes.py` | `Zernikes` class: basis, phase synthesis, scans, `filter_coefficients_by_aberration_keys`, `generate_table` |
-| `zernike_catalog.py` | Index ↔ (n, m) ↔ names; `aberration_group`, `iter_modes_by_group` |
-| `utils.py` | JSON load/save and coefficient assembly |
-| `ui/widget.py` | `ZernikesWidget` main editor |
-| `ui/coefficient_table.py` | Grouped editable coefficient tables |
-| `ui/phase_viewport.py` | Optional pyqtgraph H/V phase viewer |
-
 ## Static helpers
 
 ```python
 Zernikes.nm_to_idx(2, 0)   # → 4 (defocus)
 Zernikes.idx_to_nm(4)      # → (2, 0)
 ```
+
+## Installation
+
+### From GitHub (tagged release)
+
+```bash
+pip install "zernikes[gui] @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0"
+```
+
+Core only (no Qt widgets):
+
+```bash
+pip install "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0"
+```
+
+Other packages can pin the same dependency in `pyproject.toml`:
+
+```toml
+dependencies = [
+  "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0",
+]
+```
+
+### Local development (editable install)
+
+```bash
+git clone git@github.com:MarKo7s/zernikes.git
+cd zernikes
+pip install -e ".[gui,notebooks]"
+```
+
+### Conda environment
+
+Conda provides **Python + pip only**. Install numpy / PySide6 with **pip** so conda Qt DLLs do not conflict with PySide6 on Windows.
+
+```bash
+conda create -n zernikes python=3.11 pip -y
+conda activate zernikes
+pip install -e ".[gui,notebooks]"
+```
+
+Register a Jupyter kernel (once):
+
+```bash
+python -m ipykernel install --user --name zernikes --display-name "Python (zernikes)"
+```
+
+## Developer notes
+
+### Versioning
+
+The package version is defined in **one place only**: `pyproject.toml` → `[project].version`.
+
+Do **not** edit `__init__.py` on each release. `zernikes.__version__` is read from pip metadata after install (`importlib.metadata`).
+
+```bash
+pip show zernikes
+python -c "import zernikes; print(zernikes.__version__)"
+```
+
+Use [semantic versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
+
+### Releasing a new version
+
+1. Add an entry for the new version at the top of `CHANGELOG.md`.
+2. Bump `version` in `pyproject.toml`.
+3. Commit all changes (including the changelog).
+4. Run the release script from the repo root:
+
+```bash
+python scripts/release.py --from-changelog
+```
+
+The script reads the version from `pyproject.toml`, pushes `main`, creates annotated git tag `vX.Y.Z`, and pushes the tag. With `--from-changelog`, the tag message is taken from the matching `CHANGELOG.md` section.
+
+After that:
+
+```bash
+pip install "zernikes[gui] @ git+https://github.com/MarKo7s/zernikes.git@vX.Y.Z"
+```
+
+Dry run:
+
+```bash
+python scripts/release.py --from-changelog --dry-run
+```
+
+Optional GitHub Release (`gh` CLI):
+
+```bash
+gh release create vX.Y.Z --title "zernikes X.Y.Z" --notes-file CHANGELOG.md
+```
+
+**Requirements before release:** clean working tree; tag `vX.Y.Z` must not already exist on GitHub.
