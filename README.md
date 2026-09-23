@@ -7,6 +7,7 @@ ModeLab Zernike basis and phase-mask synthesis for SLM holography. Built on the 
 ```
 zernikes/
 ├── pyZernikes.py            Zernikes class (basis, phase synthesis, scans)
+├── coef_sync.py             on-demand JSON / backup sync check
 ├── zernike_catalog.py       index ↔ (n, m) ↔ names; aberration groups
 ├── utils.py                 JSON load/save and coefficient assembly
 ├── ui/                      optional PySide6 editor + pyqtgraph viewport
@@ -102,7 +103,9 @@ File load in the widget also refreshes the backup after each load.
 **Normal init** (load or clean → backup → synthesize):
 
 ```python
-z = Zernikes(..., coefs_path="coefs.json")  # sets z.coefs_path; or z.clean()
+z = Zernikes(...)                         # loads config/zernike_coeffs.json if present
+z = Zernikes(..., coefs_path="old.json")  # that file; falls back to the default, then zeros
+z = Zernikes(..., coefs_path=None)        # clean start, ignores the default file
 # __init__ already calls write_backup_of_zernike_coefs()
 # and calculate_znk_phase_mask(restore_coefs=False)
 ```
@@ -120,14 +123,23 @@ z.calculate_znk_phase_mask(restore_coefs=True)
 ## JSON coefficients
 
 Save / load uses compact JSON (piston, tilts, and higher-order `w` for n ≥ 2).
+Every file starts with a preamble (`schema`, `version`, `saved_at`). The schema name
+is what identifies the file; the filename is only where it lives. The default file
+is `config/zernike_coeffs.json` inside the package. Mask centers are not stored.
 If the file's `max_zernike_radial_number` differs from the instance, the instance wins;
 extra file modes are ignored and missing modes default to zero (with warnings).
 
 ```python
-z.save_coefs("coefs.json")    # updates z.coefs_path
+z.save_coefs("coefs.json")    # updates z.coefs_path; does not replace the default file
 z.load_coefs("coefs.json")
 z.calculate_znk_phase_mask()
+z.coeffs_status_sync()        # {"json": {timestamp, sync}, "backup": {timestamp, sync}}
 ```
+
+`sync` is `True` when that copy matches the current weights, `False` when it does not,
+and `None` when the copy does not exist yet. The engine does not refresh this on every
+write. Call it when you want the answer; the GUI calls it from `refresh_from_zernikes`
+and after a cell edit.
 
 ## SLM integration
 
@@ -148,7 +160,7 @@ PySide6 editor for an existing `Zernikes` instance. Install the **`gui`** extra 
 
 Features:
 
-- Load / save / reload JSON coefficients
+- Load / save / reload JSON coefficients, with last-saved and last-backup status
 - Coefficient tables grouped by aberration family (piston, tilt, defocus, …)
 - In-memory **Save to backup** / **Reload from backup**
 - Optional **Launch phase mask viewport** (H and V phase maps, grayscale −π…π)
@@ -169,6 +181,10 @@ z.tilt_x_h = 0.05
 gui.refresh_from_zernikes()   # updates tables and path label
 gui._regenerate_phase()       # recalculates masks and open viewport
 ```
+
+<!-- gui-screenshot -->
+![Zernikes GUI](docs/images/gui.png)
+<!-- /gui-screenshot -->
 
 See [`tests/zernikes_widget.ipynb`](tests/zernikes_widget.ipynb) for a notebook launcher (`%gui qt`).
 

@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -152,10 +153,12 @@ class CoefficientTablesPanel(QWidget):
         reload_backup_btn = QPushButton("Reload from backup")
         reload_backup_btn.clicked.connect(self._reload_from_backup)
 
+        self._backup_status = QLabel()
         backup_box = QGroupBox("Backup")
         backup_row = QHBoxLayout(backup_box)
         backup_row.addWidget(save_backup_btn)
         backup_row.addWidget(reload_backup_btn)
+        backup_row.addWidget(self._backup_status)
 
         viewport_btn = QPushButton("Launch phase mask viewport")
         viewport_btn.clicked.connect(self._launch_viewport)
@@ -224,8 +227,14 @@ class CoefficientTablesPanel(QWidget):
     def _on_viewport_destroyed(self, *_args) -> None:
         self._viewport = None
 
+    def apply_backup_status(self, text: str, color: str) -> None:
+        """Show the backup timestamp line painted by the parent widget."""
+        self._backup_status.setText(text)
+        self._backup_status.setStyleSheet(f"color: {color};")
+
     def _save_to_backup(self) -> None:
         self._z.write_backup_of_zernike_coefs()
+        self.coefficientsChanged.emit()
 
     def _reload_from_backup(self) -> None:
         self._z.read_backup_of_zernike_coefs()

@@ -19,7 +19,22 @@ except ImportError:
         iter_modes,
     )
 
+COEFFICIENTS_SCHEMA = "zernikes.coefficients"
 COEFFICIENTS_VERSION = 1
+
+
+def zernike_coeffs_default_path():
+    """Last-saved coefficient file inside the package config folder."""
+    return Path(__file__).resolve().parent / "config" / "zernike_coeffs.json"
+
+
+def _preamble(saved_at):
+    """File identity written with every coefficient JSON."""
+    return {
+        "schema": COEFFICIENTS_SCHEMA,
+        "version": COEFFICIENTS_VERSION,
+        "saved_at": saved_at,
+    }
 
 
 def build_nm_lists(max_zernike_radial_number):
@@ -45,12 +60,8 @@ def default_coefficients_dict(max_zernike_radial_number):
     zero_w = [0.0] * w_len
 
     return {
-        "version": COEFFICIENTS_VERSION,
+        "preamble": _preamble(None),
         "max_zernike_radial_number": max_zernike_radial_number,
-        "mask_centers": {
-            "H": {"x": 0, "y": 0},
-            "V": {"x": 0, "y": 0},
-        },
         "H": {
             "piston": 0.0,
             "tilt_x": 0.0,
@@ -69,10 +80,16 @@ def default_coefficients_dict(max_zernike_radial_number):
 
 def _validate_coefficients_data(data):
     """Validate JSON structure against the file's own max radial order."""
-    if data.get("version") != COEFFICIENTS_VERSION:
+    preamble = data.get("preamble")
+    schema = preamble.get("schema") if isinstance(preamble, dict) else None
+    if schema != COEFFICIENTS_SCHEMA:
         raise ValueError(
-            f"Unsupported coefficients version: {data.get('version')!r}. "
-            f"Expected {COEFFICIENTS_VERSION}."
+            f"Coefficients file schema is {schema!r}. Expected {COEFFICIENTS_SCHEMA!r}."
+        )
+    version = preamble.get("version")
+    if version != COEFFICIENTS_VERSION:
+        raise ValueError(
+            f"Unsupported coefficients version: {version!r}. Expected {COEFFICIENTS_VERSION}."
         )
 
     file_max_n = data.get("max_zernike_radial_number")
@@ -92,14 +109,6 @@ def _validate_coefficients_data(data):
                 f"Expected {expected_len} higher-order coefficients for '{pol}.w', "
                 f"got {len(pol_data['w'])}."
             )
-
-    mask_centers = data.get("mask_centers")
-    if mask_centers is None:
-        raise ValueError("Coefficients file is missing 'mask_centers'.")
-    for pol in ("H", "V"):
-        center = mask_centers.get(pol)
-        if center is None or "x" not in center or "y" not in center:
-            raise ValueError(f"Coefficients file is missing 'mask_centers.{pol}'.")
 
 
 def _file_pol_lookup(data, pol):
@@ -186,16 +195,12 @@ def dict_to_zernike_coefficients(data, max_zernike_radial_number=None):
     lookup_v = _file_pol_lookup(data, "V")
 
     return {
-        "h_mask_center_x": int(data["mask_centers"]["H"]["x"]),
-        "h_mask_center_y": int(data["mask_centers"]["H"]["y"]),
-        "v_mask_center_x": int(data["mask_centers"]["V"]["x"]),
-        "v_mask_center_y": int(data["mask_centers"]["V"]["y"]),
         "w_h": _assemble_weight_vector(lookup_h, max_zernike_radial_number, file_max_n),
         "w_v": _assemble_weight_vector(lookup_v, max_zernike_radial_number, file_max_n),
     }
 
 
-def zernike_coefficients_to_dict(zernikes):
+def zernike_coefficients_to_dict(zernikes, saved_at):
     """Serialize Zernikes instance coefficients to a JSON-ready dictionary."""
     max_n = zernikes.max_zernike_radial_number
     n_list, m_list = build_nm_lists(max_n)
@@ -207,18 +212,8 @@ def zernike_coefficients_to_dict(zernikes):
         compact_w_v.append(float(zernikes.w_v[idx]))
 
     return {
-        "version": COEFFICIENTS_VERSION,
+        "preamble": _preamble(saved_at),
         "max_zernike_radial_number": max_n,
-        "mask_centers": {
-            "H": {
-                "x": int(zernikes.h_mask_center_x),
-                "y": int(zernikes.h_mask_center_y),
-            },
-            "V": {
-                "x": int(zernikes.v_mask_center_x),
-                "y": int(zernikes.v_mask_center_y),
-            },
-        },
         "H": {
             "piston": float(zernikes.w_h[0]),
             "tilt_x": float(zernikes.w_h[1]),

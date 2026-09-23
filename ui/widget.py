@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -19,6 +18,20 @@ _DEFAULT_WIDTH = 960
 _DEFAULT_HEIGHT = 820
 _MIN_WIDTH = 720
 _MIN_HEIGHT = 600
+_SYNC_STYLE = {
+    True: ("up to date", "#1b7f3a"),
+    False: ("not up to date", "#c0392b"),
+    None: ("unresolved", "#b8860b"),
+}
+
+
+def _sync_line(prefix, entry):
+    """Status text and color for one JSON or backup entry."""
+    word, color = _SYNC_STYLE[entry["sync"]]
+    when = entry["timestamp"]
+    if when is None:
+        return f"{prefix} — {word}", color
+    return f"{prefix} {when.strftime('%d.%m.%Y %H:%M:%S')} — {word}", color
 
 
 class ZernikesWidget(QWidget):
@@ -49,6 +62,8 @@ class ZernikesWidget(QWidget):
         buttons_row.addWidget(reload_btn)
         buttons_row.addWidget(save_btn)
         buttons_row.addWidget(save_as_btn)
+        self._json_status = QLabel()
+        buttons_row.addWidget(self._json_status)
         buttons_row.addStretch(1)
 
         self._path_label = QLabel()
@@ -71,29 +86,6 @@ class ZernikesWidget(QWidget):
             QLabel(f"{z.SLM_pixel_size_in_um:g}"),
         )
 
-        self._h_center_x = QSpinBox()
-        self._h_center_y = QSpinBox()
-        self._v_center_x = QSpinBox()
-        self._v_center_y = QSpinBox()
-        for spin in (self._h_center_x, self._h_center_y, self._v_center_x, self._v_center_y):
-            spin.setRange(0, z.N - 1)
-            spin.setSuffix(" px")
-            spin.valueChanged.connect(self._on_center_changed)
-
-        h_center_box = QGroupBox("Mask center H")
-        h_center_form = QFormLayout(h_center_box)
-        h_center_form.addRow("x", self._h_center_x)
-        h_center_form.addRow("y", self._h_center_y)
-
-        v_center_box = QGroupBox("Mask center V")
-        v_center_form = QFormLayout(v_center_box)
-        v_center_form.addRow("x", self._v_center_x)
-        v_center_form.addRow("y", self._v_center_y)
-
-        centers_row = QHBoxLayout()
-        centers_row.addWidget(h_center_box, stretch=1)
-        centers_row.addWidget(v_center_box, stretch=1)
-
         self._coef_tables = CoefficientTablesPanel(z)
         self._coef_tables.coefficientsChanged.connect(self._regenerate_phase)
 
@@ -101,7 +93,6 @@ class ZernikesWidget(QWidget):
         layout.addLayout(buttons_row)
         layout.addWidget(self._path_label)
         layout.addWidget(params_box)
-        layout.addLayout(centers_row)
         layout.addWidget(self._coef_tables, stretch=1)
 
         self.refresh_from_zernikes()
@@ -120,31 +111,25 @@ class ZernikesWidget(QWidget):
         else:
             self._path_label.setText("No coefficients file loaded")
         self._reload_btn.setEnabled(z.coefs_path is not None)
-
-        for spin, attr in (
-            (self._h_center_x, "h_mask_center_x"),
-            (self._h_center_y, "h_mask_center_y"),
-            (self._v_center_x, "v_mask_center_x"),
-            (self._v_center_y, "v_mask_center_y"),
-        ):
-            spin.blockSignals(True)
-            spin.setValue(int(getattr(z, attr, 0)))
-            spin.blockSignals(False)
-
         self._coef_tables.refresh_from_zernikes()
+        self._apply_sync_status()
+
+    def _apply_sync_status(self):
+        """Paint JSON and backup status from the engine check."""
+        res = self._z.coeffs_status_sync()
+        text, color = _sync_line("last saved", res["json"])
+        self._json_status.setText(text)
+        self._json_status.setStyleSheet(f"color: {color};")
+        text, color = _sync_line("last backup", res["backup"])
+        self._coef_tables.apply_backup_status(text, color)
 
     def _regenerate_phase(self):
         """Regenerate the phase mask from the current coefficients and update the display."""
 
         self._z.calculate_znk_phase_mask(restore_coefs=False)
         self._coef_tables.refresh_phase_viewport()
+        self._apply_sync_status()
         self.phaseMaskChanged.emit()
-
-    def _on_center_changed(self):
-        self._z.h_mask_center_x = self._h_center_x.value()
-        self._z.h_mask_center_y = self._h_center_y.value()
-        self._z.v_mask_center_x = self._v_center_x.value()
-        self._z.v_mask_center_y = self._v_center_y.value()
 
     def _after_load(self):
         self._z.write_backup_of_zernike_coefs()

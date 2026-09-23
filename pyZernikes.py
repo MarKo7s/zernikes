@@ -4,6 +4,9 @@ Weights live in unified vectors ``w_h`` and ``w_v`` indexed by basis row.
 ``piston_h``, ``tilt_x_h``, and ``tilt_y_h`` are property aliases into ``w_h[0:3]``.
 """
 
+import json
+import warnings
+from datetime import datetime
 from math import factorial
 from pathlib import Path
 
@@ -12,12 +15,14 @@ import numpy as np
 
 #Double import so it can be used as module and in the notebook
 try:
+    from .coef_sync import CoefSync
     from .utils import (
         default_coefficients_dict,
         dict_to_zernike_coefficients,
         load_coefficients_json,
         save_coefficients_json,
         zernike_coefficients_to_dict,
+        zernike_coeffs_default_path,
     )
     from .zernike_catalog import (
         IDX_DEFOCUS,
@@ -30,12 +35,14 @@ try:
         ABERRATION_GROUPS
     )
 except ImportError:
+    from coef_sync import CoefSync
     from utils import (
         default_coefficients_dict,
         dict_to_zernike_coefficients,
         load_coefficients_json,
         save_coefficients_json,
         zernike_coefficients_to_dict,
+        zernike_coeffs_default_path,
     )
     from zernike_catalog import (
         IDX_DEFOCUS,
@@ -71,7 +78,7 @@ class Zernikes:
         mask_size_y_in_pixels=1024,
         aperture_diameter_in_m=7.5e-3,
         SLM_pixel_size_in_um=9.2e-6,
-        coefs_path=None,
+        coefs_path=zernike_coeffs_default_path(),
     ):
         """Create Zernike basis, load coefficients, and compute initial phase masks.
 
@@ -81,7 +88,9 @@ class Zernikes:
             mask_size_y_in_pixels: Mask height in pixels.
             aperture_diameter_in_m: Aperture diameter in metres.
             SLM_pixel_size_in_um: Pixel size in metres (9.2 µm stored as 9.2e-6).
-            coefs_path: Optional JSON coefficients file; zeros if omitted.
+            coefs_path: JSON file to load. Defaults to config/zernike_coeffs.json.
+                Pass None for a clean start. A missing or invalid path warns and
+                falls back to the default file, then to zeros.
         """
         self.max_zernike_radial_number = max_zernike_radial_number
         self.mask_size_x_in_pixels = mask_size_x_in_pixels
@@ -106,12 +115,11 @@ class Zernikes:
             rho, phi, max_zernike_radial_number
         )
         self._init_buffers()
+        self._json_w_h = None
+        self._json_w_v = None
+        self._coef_sync = CoefSync()
         self.coefs_path = None
-
-        if coefs_path is not None:
-            self.load_coefs(coefs_path)
-        else:
-            self.clean()
+        self._resolve_coefs_path(coefs_path)
 
         self.write_backup_of_zernike_coefs()
         self.calculate_znk_phase_mask(restore_coefs=False)
@@ -131,6 +139,8 @@ class Zernikes:
         count = expected_zernike_count(self.max_zernike_radial_number)
         self.w_h = np.zeros(count, dtype=np.float32)
         self.w_v = np.zeros(count, dtype=np.float32)
+        self.b_w_h = None
+        self.b_w_v = None
 
         self.znk_phase_h = np.zeros((self.N, self.N), dtype=np.float32)
         self.znk_phase_v = np.zeros((self.N, self.N), dtype=np.float32)
@@ -272,22 +282,68 @@ class Zernikes:
         return zernike_basis_array
 
     def _apply_coefficients(self, coefficients):
-        """Load mask centers and unified weight vectors from a coefficient dict."""
-        self.h_mask_center_x = coefficients["h_mask_center_x"]
-        self.h_mask_center_y = coefficients["h_mask_center_y"]
-        self.v_mask_center_x = coefficients["v_mask_center_x"]
-        self.v_mask_center_y = coefficients["v_mask_center_y"]
+        """Load unified weight vectors from a coefficient dict."""
         self.w_h = np.asarray(coefficients["w_h"], dtype=np.float32)
         self.w_v = np.asarray(coefficients["w_v"], dtype=np.float32)
 
     def clean(self):
-        """Reset all coefficients and mask centers to zero."""
+        """Reset all coefficients to zero."""
         self._apply_coefficients(
             dict_to_zernike_coefficients(
                 default_coefficients_dict(self.max_zernike_radial_number),
                 max_zernike_radial_number=self.max_zernike_radial_number,
             )
         )
+
+    def _resolve_coefs_path(self, coefs_path):
+        """Load coefs_path, then the default file, then start from zeros."""
+        if coefs_path is None:
+            self.clean()
+            self.coefs_path = None
+            return
+
+        path = Path(coefs_path)
+        default = zernike_coeffs_default_path()
+        loaded, reason = self._try_load_coefs(path)
+        if loaded:
+            return
+
+        if path.resolve() == default.resolve():
+            warnings.warn(
+                f"{path}: {reason}. Starting with zero coefficients.",
+                stacklevel=2,
+            )
+            self.clean()
+            self.coefs_path = None
+            return
+
+        warnings.warn(f"{path}: {reason}. Trying {default}.", stacklevel=2)
+        loaded, reason = self._try_load_coefs(default)
+        if loaded:
+            return
+        warnings.warn(
+            f"{default}: {reason}. Starting with zero coefficients.",
+            stacklevel=2,
+        )
+        self.clean()
+        self.coefs_path = None
+
+    def _try_load_coefs(self, path):
+        """Load one file. Return (True, None) or (False, reason)."""
+        path = Path(path)
+        if not path.is_file():
+            return False, "file not found"
+        try:
+            self.load_coefs(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return False, str(exc)
+        return True, None
+
+    def _snapshot_json_mirror(self, when):
+        """Copy current weights as the in-memory image of the last JSON file."""
+        self._json_w_h = np.copy(self.w_h)
+        self._json_w_v = np.copy(self.w_v)
+        self._coef_sync.json_saved_at = when
 
     def load_coefs(self, path):
         """Load coefficients from JSON (instance radial order wins on mismatch)."""
@@ -298,17 +354,38 @@ class Zernikes:
         )
         self._apply_coefficients(coefficients)
         self.coefs_path = str(Path(path).resolve())
+        saved_at = data.get("preamble", {}).get("saved_at")
+        when = datetime.fromisoformat(saved_at) if saved_at else None
+        self._snapshot_json_mirror(when)
 
     def save_coefs(self, path):
         """Save current coefficients to JSON."""
-        data = zernike_coefficients_to_dict(self)
+        when = datetime.now().astimezone().replace(microsecond=0)
+        data = zernike_coefficients_to_dict(self, when.isoformat(timespec="seconds"))
         save_coefficients_json(path, data)
         self.coefs_path = str(Path(path).resolve())
+        self._snapshot_json_mirror(when)
 
     def write_backup_of_zernike_coefs(self):
         """Snapshot current ``w_h`` / ``w_v`` as the base coefficient state."""
         self.b_w_h = np.copy(self.w_h)
         self.b_w_v = np.copy(self.w_v)
+        self._coef_sync.backup_at = datetime.now().astimezone().replace(microsecond=0)
+
+    def coeffs_status_sync(self):
+        """Compare current weights with the JSON mirror and the RAM backup.
+
+        Returns ``{"json": {"timestamp", "sync"}, "backup": {"timestamp", "sync"}}``.
+        ``sync`` is True, False, or None when that copy does not exist yet.
+        """
+        return self._coef_sync.status(
+            self.w_h,
+            self.w_v,
+            self._json_w_h,
+            self._json_w_v,
+            self.b_w_h,
+            self.b_w_v,
+        )
 
     def read_backup_of_zernike_coefs(self):
         """Restore ``w_h`` / ``w_v`` from the last backup snapshot."""
