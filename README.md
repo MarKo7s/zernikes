@@ -200,20 +200,20 @@ Zernikes.idx_to_nm(4)      # → (2, 0)
 ### From GitHub (tagged release)
 
 ```bash
-pip install "zernikes[gui] @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0"
+pip install "zernikes[gui] @ git+https://github.com/MarKo7s/zernikes.git@v1.1.0"
 ```
 
 Core only (no Qt widgets):
 
 ```bash
-pip install "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0"
+pip install "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.1.0"
 ```
 
 Other packages can pin the same dependency in `pyproject.toml`:
 
 ```toml
 dependencies = [
-  "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.0.0",
+  "zernikes @ git+https://github.com/MarKo7s/zernikes.git@v1.1.0",
 ]
 ```
 
