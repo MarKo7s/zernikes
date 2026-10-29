@@ -1,6 +1,6 @@
 """Standalone Zernike coefficient editor widget."""
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -110,9 +110,31 @@ class ZernikesWidget(QWidget):
             self._path_label.setText(f"Loaded: {z.coefs_path}")
         else:
             self._path_label.setText("No coefficients file loaded")
+
         self._reload_btn.setEnabled(z.coefs_path is not None)
         self._coef_tables.refresh_from_zernikes()
         self._apply_sync_status()
+
+    def refresh_all_from_zernikes(self):
+        """ Refresh gui from internal zernike coeffs and recalculate the mask, update zernike gui viewport """
+        z = self._z
+
+        if z.coefs_path:
+            self._path_label.setText(f"Loaded: {z.coefs_path}")
+        else:
+            self._path_label.setText("No coefficients file loaded")
+
+        self._reload_btn.setEnabled(z.coefs_path is not None)
+        self._coef_tables.refresh_from_zernikes()
+
+        self._z.calculate_znk_phase_mask(restore_coefs=False)
+        self._coef_tables.refresh_phase_viewport()
+        self._apply_sync_status()
+        self.phaseMaskChanged.emit()
+
+    def refresh_all_from_zernikes_async(self):
+        """ Refresh gui from internal zernike coeffs and recalculate the mask, update zernike gui viewport (THREAD SAFE) """
+        QTimer.singleShot(0, self, self.refresh_all_from_zernikes) #when called from other thread, self.refresh_all_from_zernikes is queued into (Self) living in the main thread
 
     def _apply_sync_status(self):
         """Paint JSON and backup status from the engine check."""
@@ -178,3 +200,12 @@ class ZernikesWidget(QWidget):
             path = f"{path}.json"
         self._z.save_coefs(path)
         self.refresh_from_zernikes()
+
+    def enable_user_interface(self, state, run_async = False) -> None:
+        if run_async:
+            QTimer.singleShot(0, self, lambda state=state: self._enable_user_interface(state))
+        else:
+            self._enable_user_interface(state)
+
+    def _enable_user_interface(self, state):
+        self.setEnabled(state)

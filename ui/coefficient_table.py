@@ -22,6 +22,9 @@ try:
 except ImportError:
     from ..zernike_catalog import ABERRATION_GROUPS, get_mode_name, iter_modes_by_group
 
+# Up / Down step for a selected H or V coefficient cell.
+COEFFICIENT_KEY_STEP = 0.1
+
 _COL_INDEX = 0
 _COL_N = 1
 _COL_M = 2
@@ -61,6 +64,26 @@ def _configure_table_columns(table: QTableWidget) -> None:
     table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
 
 
+class _CoefficientTable(QTableWidget):
+    """Coefficient grid. Up and Down step the selected H or V cell."""
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        col = self.currentColumn()
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down) and col in (_COL_H, _COL_V):
+            item = self.item(self.currentRow(), col)
+            if item is not None:
+                try:
+                    value = float(item.text())
+                except ValueError:
+                    value = 0.0
+                step = COEFFICIENT_KEY_STEP if key == Qt.Key.Key_Up else -COEFFICIENT_KEY_STEP
+                item.setText(f"{round(value + step, 10):.6g}")
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
 class _ModeGroupTable(QGroupBox):
     """One aberration family table inside a group box."""
 
@@ -71,7 +94,7 @@ class _ModeGroupTable(QGroupBox):
         self._z = zernikes
         self._row_indices = [idx for idx, _, _ in modes]
 
-        self._table = QTableWidget()
+        self._table = _CoefficientTable()
         self._table.setColumnCount(len(_HEADERS))
         self._table.setHorizontalHeaderLabels(list(_HEADERS))
         self._table.setAlternatingRowColors(True)

@@ -34,6 +34,8 @@ try:
         iter_modes_by_group,
         ABERRATION_GROUPS
     )
+    from .utilities import CustomSignal
+
 except ImportError:
     from coef_sync import CoefSync
     from utils import (
@@ -54,7 +56,8 @@ except ImportError:
         iter_modes_by_group,
         ABERRATION_GROUPS
     )
-
+    from utilities import CustomSignal
+    
 
 def cart2pol(x, y):
     """Cartesian to polar (rho, phi)."""
@@ -114,6 +117,9 @@ class Zernikes:
         self.zernike_basis_array = self.generate_zernike_basis(
             rho, phi, max_zernike_radial_number
         )
+
+        self.onPhaseMaskChanged = CustomSignal() #other classes can connect to this signal and register a callback function to be called when the phase mask changes
+
         self._init_buffers()
         self._json_w_h = None
         self._json_w_v = None
@@ -123,6 +129,8 @@ class Zernikes:
 
         self.write_backup_of_zernike_coefs()
         self.calculate_znk_phase_mask(restore_coefs=False)
+
+
 
     @staticmethod
     def nm_to_idx(n, m):
@@ -279,6 +287,11 @@ class Zernikes:
                 idx = (n * (n + 2) + m) // 2
                 zernike_basis_array[idx] = z_nm
 
+        # Piston is R_0^0 minus its center value, so the row is 0 inside the pupil
+        # and -1 outside. Adding 1 makes it 1 inside the pupil. Weight w is then
+        # a uniform phase of w*pi radians.
+        zernike_basis_array[0] += 1
+
         return zernike_basis_array
 
     def _apply_coefficients(self, coefficients):
@@ -394,6 +407,7 @@ class Zernikes:
 
     def modify_zernike_coefs(
         self,
+        pol: str,
         apply_tilt_offset=False,
         apply_defocus_offset=False,
         scan_tilt=False,
@@ -404,39 +418,51 @@ class Zernikes:
 
         Snapshots backup first. Follow with ``calculate_znk_phase_mask(restore_coefs=True)``.
         """
+        if pol not in ["H", "V", "HV"]:
+            raise ValueError(f"Invalid polarization: {pol}")
+        
         self.write_backup_of_zernike_coefs()
 
-        if apply_tilt_offset or apply_defocus_offset:
-            if "MASK_corrections" not in kwargs:
-                raise ValueError(
-                    '"apply_tilt_offset" or "apply_defocus_offset" requires '
-                    '"MASK_corrections" dictionary.'
-                )
-            mask_corrections = kwargs["MASK_corrections"]
+        for target_pol in pol:
+            if apply_tilt_offset or apply_defocus_offset:
+                if "MASK_corrections" not in kwargs:
+                    raise ValueError(
+                        '"apply_tilt_offset" or "apply_defocus_offset" requires '
+                        '"MASK_corrections" dictionary.'
+                    )
+                mask_corrections = kwargs["MASK_corrections"]
 
-            if apply_tilt_offset:
-                self.tilt_x_h += mask_corrections["tilt_x_H"]
-                self.tilt_y_h += mask_corrections["tilt_y_H"]
-                self.tilt_x_v += mask_corrections["tilt_x_V"]
-                self.tilt_y_v += mask_corrections["tilt_y_V"]
+                if apply_tilt_offset:
+                    if target_pol == "H":
+                        self.tilt_x_h += mask_corrections["tilt_x_H"]
+                        self.tilt_y_h += mask_corrections["tilt_y_H"]
+                    elif target_pol == "V":
+                        self.tilt_x_v += mask_corrections["tilt_x_V"]
+                        self.tilt_y_v += mask_corrections["tilt_y_V"]
 
-            if apply_defocus_offset:
-                self.w_h[IDX_DEFOCUS] += mask_corrections["defocus_H"]
-                self.w_v[IDX_DEFOCUS] += mask_corrections["defocus_V"]
+                if apply_defocus_offset:
+                    if target_pol == "H":
+                        self.w_h[IDX_DEFOCUS] += mask_corrections["defocus_H"]
+                    elif target_pol == "V":
+                        self.w_v[IDX_DEFOCUS] += mask_corrections["defocus_V"]
 
-        if scan_tilt:
-            if not all(key in kwargs for key in ("tilt_x", "tilt_y")):
-                raise ValueError('scan_tilt=True requires "tilt_x" and "tilt_y" keyword arguments.')
-            self.tilt_x_h += kwargs["tilt_x"]
-            self.tilt_y_h += kwargs["tilt_y"]
-            self.tilt_x_v += kwargs["tilt_x"]
-            self.tilt_y_v += kwargs["tilt_y"]
+            if scan_tilt:
+                if not all(key in kwargs for key in ("tilt_x", "tilt_y")):
+                    raise ValueError('scan_tilt=True requires "tilt_x" and "tilt_y" keyword arguments.')
+                if target_pol == "H":
+                    self.tilt_x_h += kwargs["tilt_x"]
+                    self.tilt_y_h += kwargs["tilt_y"]
+                elif target_pol == "V":
+                    self.tilt_x_v += kwargs["tilt_x"]
+                    self.tilt_y_v += kwargs["tilt_y"]
 
-        if scan_defocus:
-            if "defocus" not in kwargs:
-                raise ValueError('scan_defocus=True requires "defocus" keyword argument.')
-            self.w_h[IDX_DEFOCUS] += kwargs["defocus"]
-            self.w_v[IDX_DEFOCUS] += kwargs["defocus"]
+            if scan_defocus:
+                if "defocus" not in kwargs:
+                    raise ValueError('scan_defocus=True requires "defocus" keyword argument.')
+                if target_pol == "H":
+                    self.w_h[IDX_DEFOCUS] += kwargs["defocus"]
+                elif pol == "V":
+                    self.w_v[IDX_DEFOCUS] += kwargs["defocus"]
 
     def calculate_znk_phase_mask(self, restore_coefs=False):
         """Synthesize wrapped phase masks ``znk_phase_h`` and ``znk_phase_v``.
@@ -467,6 +493,8 @@ class Zernikes:
 
         if restore_coefs:
             self.read_backup_of_zernike_coefs()
+
+        self.onPhaseMaskChanged.emit() #emit the signal to notify other classes that the phase mask has changed
 
     def make_zernike_fields(self, restore_coefs=False):
         """Deprecated alias for ``calculate_znk_phase_mask``."""

@@ -1,6 +1,6 @@
 [project]
 name = "zernikes"
-version = "1.1.0"
+version = "1.2.0"
 description = "ModeLab Zernike basis and phase-mask synthesis for SLM holography"
 readme = "README.md"
 requires-python = ">=3.10"
